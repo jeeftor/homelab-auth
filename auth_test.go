@@ -11,7 +11,7 @@ import (
 
 func testProvider(t *testing.T) *Provider {
 	t.Helper()
-	return &Provider{config: Config{CookieName: "test_session", SessionSecret: []byte("0123456789abcdef0123456789abcdef"), SessionDuration: time.Hour, InsecureCookies: true}, logger: slog.Default()}
+	return &Provider{config: Config{CookieName: "test_session", StateCookieName: "test_state", SessionSecret: []byte("0123456789abcdef0123456789abcdef"), SessionDuration: time.Hour, InsecureCookies: true}, logger: slog.Default()}
 }
 
 func TestNewRejectsUnsafeConfiguration(t *testing.T) {
@@ -70,5 +70,49 @@ func TestRequireGroups(t *testing.T) {
 	protected.ServeHTTP(denied, deniedRequest)
 	if denied.Code != http.StatusForbidden {
 		t.Fatalf("denied status = %d", denied.Code)
+	}
+}
+
+func TestValidateConfigRejectsUnsafeConfiguration(t *testing.T) {
+	base := Config{
+		Issuer:          "https://id.example",
+		ClientID:        "client",
+		ClientSecret:    "secret",
+		RedirectURL:     "https://app.example/auth/callback",
+		SessionSecret:   []byte("0123456789abcdef0123456789abcdef"),
+		CookieName:      "__Host-session",
+		StateCookieName: "__Host-state",
+		SessionDuration: time.Hour,
+	}
+
+	for name, config := range map[string]Config{
+		"missing client secret":    func() Config { value := base; value.ClientSecret = ""; return value }(),
+		"HTTP production redirect": func() Config { value := base; value.RedirectURL = "http://app.example/auth/callback"; return value }(),
+		"non-local insecure redirect": func() Config {
+			value := base
+			value.InsecureCookies = true
+			value.RedirectURL = "http://app.example/auth/callback"
+			return value
+		}(),
+		"host cookie domain": func() Config { value := base; value.CookieDomain = "example.com"; return value }(),
+		"long session":       func() Config { value := base; value.SessionDuration = maxSessionTTL + time.Second; return value }(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := validateConfig(config); err == nil {
+				t.Fatal("validateConfig accepted unsafe configuration")
+			}
+		})
+	}
+}
+
+func TestLogoutHandlerRequiresPOST(t *testing.T) {
+	p := testProvider(t)
+	recorder := httptest.NewRecorder()
+	p.LogoutHandler(recorder, httptest.NewRequest(http.MethodGet, "/auth/logout", nil))
+	if recorder.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("logout GET status = %d", recorder.Code)
+	}
+	if got := recorder.Header().Get("Allow"); got != http.MethodPost {
+		t.Fatalf("Allow = %q", got)
 	}
 }

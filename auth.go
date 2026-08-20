@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -20,10 +21,11 @@ import (
 )
 
 const (
-	defaultCookieName = "homelab_auth"
-	stateCookieName   = "homelab_oidc_state"
+	defaultCookieName = "__Host-homelab_auth"
+	localCookieName   = "homelab_auth"
 	stateLifetime     = 10 * time.Minute
 	defaultSessionTTL = 8 * time.Hour
+	maxSessionTTL     = 24 * time.Hour
 )
 
 // Config configures an OIDC client and its signed session cookie.
@@ -36,6 +38,7 @@ type Config struct {
 	SessionSecret []byte
 
 	CookieName      string
+	StateCookieName string
 	CookieDomain    string
 	SessionDuration time.Duration
 	InsecureCookies bool // Set only for local HTTP development.
@@ -61,17 +64,20 @@ type Provider struct {
 
 // New discovers the issuer and constructs a Provider.
 func New(ctx context.Context, config Config) (*Provider, error) {
-	if strings.TrimSpace(config.Issuer) == "" || strings.TrimSpace(config.ClientID) == "" || strings.TrimSpace(config.RedirectURL) == "" {
-		return nil, errors.New("issuer, client ID, and redirect URL are required")
-	}
-	if len(config.SessionSecret) < 32 {
-		return nil, errors.New("session secret must contain at least 32 random bytes")
-	}
 	if config.CookieName == "" {
 		config.CookieName = defaultCookieName
+		if config.InsecureCookies {
+			config.CookieName = localCookieName
+		}
+	}
+	if config.StateCookieName == "" {
+		config.StateCookieName = config.CookieName + "_oidc_state"
 	}
 	if config.SessionDuration <= 0 {
 		config.SessionDuration = defaultSessionTTL
+	}
+	if err := validateConfig(config); err != nil {
+		return nil, err
 	}
 	if config.Logger == nil {
 		config.Logger = slog.Default()
@@ -127,6 +133,7 @@ func (p *Provider) LoginHandler(w http.ResponseWriter, r *http.Request) {
 func (p *Provider) CallbackHandler(w http.ResponseWriter, r *http.Request) {
 	stored, err := p.readState(r)
 	if err != nil || stored.ExpiresAt.Before(time.Now()) || !secureEqual(stored.State, r.URL.Query().Get("state")) {
+		p.clearStateCookie(w)
 		p.logger.Warn("OIDC callback rejected", "reason", "invalid_state")
 		http.Error(w, "invalid login state", http.StatusBadRequest)
 		return
@@ -151,7 +158,7 @@ func (p *Provider) CallbackHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "login failed", http.StatusUnauthorized)
 		return
 	}
-	if verified.Nonce != stored.Nonce {
+	if !secureEqual(verified.Nonce, stored.Nonce) {
 		p.logger.Warn("OIDC callback rejected", "reason", "invalid_nonce")
 		http.Error(w, "login failed", http.StatusUnauthorized)
 		return
@@ -175,12 +182,17 @@ func (p *Provider) CallbackHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "login failed", http.StatusInternalServerError)
 		return
 	}
-	p.logger.Info("OIDC session established", "subject", identity.Subject, "group_count", len(identity.Groups))
+	p.logger.Info("OIDC session established", "group_count", len(identity.Groups))
 	http.Redirect(w, r, "/", http.StatusFound)
 }
 
 // LogoutHandler clears the current session cookie and redirects to the site root.
 func (p *Provider) LogoutHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	p.clearSessionCookie(w)
 	p.logger.Info("OIDC session ended")
 	http.Redirect(w, r, "/", http.StatusFound)
@@ -246,11 +258,11 @@ type sessionRecord struct {
 
 func (p *Provider) setStateCookie(w http.ResponseWriter, state stateRecord) {
 	value, _ := p.encodeSigned(state)
-	p.setCookie(w, stateCookieName, value, int(stateLifetime.Seconds()))
+	p.setCookie(w, p.config.StateCookieName, value, int(stateLifetime.Seconds()))
 }
 
 func (p *Provider) readState(r *http.Request) (stateRecord, error) {
-	cookie, err := r.Cookie(stateCookieName)
+	cookie, err := r.Cookie(p.config.StateCookieName)
 	if err != nil {
 		return stateRecord{}, err
 	}
@@ -258,7 +270,9 @@ func (p *Provider) readState(r *http.Request) (stateRecord, error) {
 	return state, p.decodeSigned(cookie.Value, &state)
 }
 
-func (p *Provider) clearStateCookie(w http.ResponseWriter) { p.setCookie(w, stateCookieName, "", -1) }
+func (p *Provider) clearStateCookie(w http.ResponseWriter) {
+	p.setCookie(w, p.config.StateCookieName, "", -1)
+}
 
 func (p *Provider) setSessionCookie(w http.ResponseWriter, identity Identity) error {
 	value, err := p.encodeSigned(sessionRecord{Identity: identity, ExpiresAt: time.Now().Add(p.config.SessionDuration)})
@@ -328,4 +342,41 @@ func hasAnyGroup(actual, required []string) bool {
 		}
 	}
 	return false
+}
+
+func validateConfig(config Config) error {
+	if strings.TrimSpace(config.Issuer) == "" || strings.TrimSpace(config.ClientID) == "" || strings.TrimSpace(config.ClientSecret) == "" || strings.TrimSpace(config.RedirectURL) == "" {
+		return errors.New("issuer, client ID, client secret, and redirect URL are required")
+	}
+	if len(config.SessionSecret) < 32 {
+		return errors.New("session secret must contain at least 32 random bytes")
+	}
+	if config.SessionDuration > maxSessionTTL {
+		return fmt.Errorf("session duration must not exceed %s", maxSessionTTL)
+	}
+
+	redirectURL, err := url.Parse(config.RedirectURL)
+	if err != nil || redirectURL.Host == "" {
+		return errors.New("redirect URL must be an absolute URL")
+	}
+	if config.InsecureCookies {
+		if redirectURL.Scheme != "http" || !isLoopbackHost(redirectURL.Hostname()) {
+			return errors.New("insecure cookies require an HTTP localhost redirect URL")
+		}
+	} else if redirectURL.Scheme != "https" {
+		return errors.New("redirect URL must use HTTPS when insecure cookies are disabled")
+	}
+	if strings.HasPrefix(config.CookieName, "__Host-") && (config.InsecureCookies || config.CookieDomain != "") {
+		return errors.New("__Host- cookies require secure cookies and no cookie domain")
+	}
+	for _, name := range []string{config.CookieName, config.StateCookieName} {
+		if err := (&http.Cookie{Name: name, Value: "x", Path: "/"}).Valid(); err != nil {
+			return fmt.Errorf("invalid cookie name %q: %w", name, err)
+		}
+	}
+	return nil
+}
+
+func isLoopbackHost(host string) bool {
+	return host == "localhost" || host == "127.0.0.1" || host == "::1"
 }
